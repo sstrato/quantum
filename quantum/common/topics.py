@@ -31,6 +31,9 @@ L3_AGENT = 'l3_agent'
 DHCP_AGENT = 'dhcp_agent'
 LOADBALANCER_AGENT = 'loadbalancer_agent'
 
+DHCP_MULTI_HOST = 'dhcp_multi_host'
+L3_MULTI_HOST = 'l3_multi_host'
+
 
 def get_topic_name(prefix, table, operation):
     """Create a topic name.
