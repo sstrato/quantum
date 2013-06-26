@@ -490,10 +490,13 @@ class L3NATAgent(manager.Manager):
 
     def external_gateway_nat_rules(self, ex_gw_ip, internal_cidrs,
                                    interface_name):
-        rules = [('POSTROUTING', '! -i %(interface_name)s '
-                  '! -o %(interface_name)s -m conntrack ! '
-                  '--ctstate DNAT -j ACCEPT' % locals())]
+        #rules = [('POSTROUTING', '! -i %(interface_name)s '
+        #          '! -o %(interface_name)s -m conntrack ! '
+        #          '--ctstate DNAT -j ACCEPT' % locals())]
+        rules = []
         for cidr in internal_cidrs:
+            rules.extend([('POSTROUTING', '-s %s -d %s -j ACCEPT' %
+                          (cidr, cidr))])
             rules.extend(self.internal_network_nat_rules(ex_gw_ip, cidr))
         return rules
 
