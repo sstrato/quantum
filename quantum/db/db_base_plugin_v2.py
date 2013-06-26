@@ -773,8 +773,14 @@ class QuantumDbPluginV2(quantum_plugin_base_v2.QuantumPluginBaseV2):
         """
 
         subnet = netaddr.IPNetwork(subnet_cidr)
-        subnet_first_ip = netaddr.IPAddress(subnet.first + 1)
-        subnet_last_ip = netaddr.IPAddress(subnet.last - 1)
+        mask = subnet_cidr.split('/')[1]
+
+        if mask == '32':
+            subnet_first_ip = subnet_last_ip = netaddr.IPAddress(subnet.first)
+        # add /31 here later, if needed
+        else:
+            subnet_first_ip = netaddr.IPAddress(subnet.first + 1) 
+            subnet_last_ip = netaddr.IPAddress(subnet.last - 1)
 
         LOG.debug(_("Performing IP validity checks on allocation pools"))
         ip_sets = []
@@ -857,18 +863,26 @@ class QuantumDbPluginV2(quantum_plugin_base_v2.QuantumPluginBaseV2):
         pools = []
         # Auto allocate the pool around gateway_ip
         net = netaddr.IPNetwork(subnet['cidr'])
-        first_ip = net.first + 1
-        last_ip = net.last - 1
-        gw_ip = int(netaddr.IPAddress(subnet['gateway_ip'] or net.last))
-        # Use the gw_ip to find a point for splitting allocation pools
-        # for this subnet
-        split_ip = min(max(gw_ip, net.first), net.last)
-        if split_ip > first_ip:
-            pools.append({'start': str(netaddr.IPAddress(first_ip)),
-                          'end': str(netaddr.IPAddress(split_ip - 1))})
-        if split_ip < last_ip:
-            pools.append({'start': str(netaddr.IPAddress(split_ip + 1)),
-                          'end': str(netaddr.IPAddress(last_ip))})
+        mask = subnet['cidr'].split('/')[1]
+
+        if mask == '32':
+            pools.append({'start': str(netaddr.IPAddress(net.first)),
+                          'end': str(netaddr.IPAddress(net.first))})
+        # add /31 here later, if needed
+        else:
+            first_ip = net.first + 1
+            last_ip = net.last - 1
+            gw_ip = int(netaddr.IPAddress(subnet['gateway_ip'] or net.last))
+            # Use the gw_ip to find a point for splitting allocation pools
+            # for this subnet
+            split_ip = min(max(gw_ip, net.first), net.last)
+            if split_ip > first_ip:
+                pools.append({'start': str(netaddr.IPAddress(first_ip)),
+                              'end': str(netaddr.IPAddress(split_ip - 1))})
+            if split_ip < last_ip:
+                pools.append({'start': str(netaddr.IPAddress(split_ip + 1)),
+                              'end': str(netaddr.IPAddress(last_ip))})
+
         # return auto-generated pools
         # no need to check for their validity
         return pools
@@ -1117,9 +1131,15 @@ class QuantumDbPluginV2(quantum_plugin_base_v2.QuantumPluginBaseV2):
 
         s = subnet['subnet']
         net = netaddr.IPNetwork(s['cidr'])
+        mask = s['cidr'].split('/')[1]
 
-        if s['gateway_ip'] is attributes.ATTR_NOT_SPECIFIED:
-            s['gateway_ip'] = str(netaddr.IPAddress(net.first + 1))
+        if mask == '32':
+            s['gateway_ip'] = None 
+            s['enable_dhcp'] = False
+        # add /31 here later, if needed
+        else:
+            if s['gateway_ip'] == attributes.ATTR_NOT_SPECIFIED:
+                s['gateway_ip'] = str(netaddr.IPAddress(net.first + 1))
 
         if s['allocation_pools'] == attributes.ATTR_NOT_SPECIFIED:
             s['allocation_pools'] = self._allocate_pools_for_subnet(context, s)
