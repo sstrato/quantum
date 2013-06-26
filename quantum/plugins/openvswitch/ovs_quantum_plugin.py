@@ -38,9 +38,11 @@ from quantum.db import db_base_plugin_v2
 from quantum.db import dhcp_rpc_base
 from quantum.db import extraroute_db
 from quantum.db import l3_rpc_base
-# NOTE: quota_db cannot be removed, it is for db model
-from quantum.db import quota_db
+from quantum.db import multihost_db
+from quantum.db import portbindings_db
+from quantum.db import quota_db  # noqa
 from quantum.db import securitygroups_rpc_base as sg_db_rpc
+from quantum.extensions import multihost
 from quantum.extensions import portbindings
 from quantum.extensions import providernet as provider
 from quantum.extensions import securitygroup as ext_sg
@@ -76,8 +78,10 @@ class OVSRpcCallbacks(dhcp_rpc_base.DhcpRpcCallbackMixin,
         If a manager would like to set an rpc API version, or support more than
         one class as the target of rpc messages, override this method.
         '''
-        return q_rpc.PluginRpcDispatcher([self,
-                                          agents_db.AgentExtRpcCallback()])
+        return q_rpc.PluginRpcDispatcher(
+            [self,
+             agents_db.AgentExtRpcCallback(),
+             multihost_db.L3MultihostPluginApiCallback()])
 
     @classmethod
     def get_port_from_device(cls, device):
@@ -215,7 +219,9 @@ class AgentNotifierApi(proxy.RpcProxy,
 class OVSQuantumPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                          extraroute_db.ExtraRoute_db_mixin,
                          sg_db_rpc.SecurityGroupServerRpcMixin,
-                         agentschedulers_db.AgentSchedulerDbMixin):
+                         agentschedulers_db.AgentSchedulerDbMixin,
+                         portbindings_db.PortBindingMixin,
+                         multihost_db.Multihost_db_mixin):
 
     """Implement the Quantum abstractions using Open vSwitch.
 
@@ -243,7 +249,8 @@ class OVSQuantumPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
 
     _supported_extension_aliases = ["provider", "router",
                                     "binding", "quotas", "security-group",
-                                    "agent", "extraroute", "agent_scheduler"]
+                                    "agent", "extraroute", "agent_scheduler",
+                                    "multihost"]
 
     @property
     def supported_extension_aliases(self):
@@ -255,10 +262,13 @@ class OVSQuantumPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
 
     network_view = "extension:provider_network:view"
     network_set = "extension:provider_network:set"
-    binding_view = "extension:port_binding:view"
-    binding_set = "extension:port_binding:set"
 
     def __init__(self, configfile=None):
+        self.extra_binding_dict = {
+            portbindings.VIF_TYPE: portbindings.VIF_TYPE_OVS,
+            portbindings.CAPABILITIES: {
+                portbindings.CAP_PORT_FILTER:
+                'security-group' in self.supported_extension_aliases}}
         ovs_db_v2.initialize()
         self._parse_network_vlan_ranges()
         ovs_db_v2.sync_vlan_allocations(self.network_vlan_ranges)
@@ -500,8 +510,11 @@ class OVSQuantumPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                                           physical_network, segmentation_id)
 
             self._process_l3_create(context, network['network'], net['id'])
+            self._process_multihost_net_create(
+                context, network['network'], net['id'])
             self._extend_network_dict_provider(context, net)
             self._extend_network_dict_l3(context, net)
+            self._extend_network_dict_multihost(context, net)
             # note - exception will rollback entire transaction
         LOG.debug(_("Created network: %s"), net['id'])
         return net
@@ -516,6 +529,7 @@ class OVSQuantumPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
             self._process_l3_update(context, network['network'], id)
             self._extend_network_dict_provider(context, net)
             self._extend_network_dict_l3(context, net)
+            self._extend_network_dict_multihost(context, net)
         return net
 
     def delete_network(self, context, id):
@@ -542,6 +556,7 @@ class OVSQuantumPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                                                               id, None)
             self._extend_network_dict_provider(context, net)
             self._extend_network_dict_l3(context, net)
+            self._extend_network_dict_multihost(context, net)
         return self._fields(net, fields)
 
     def get_networks(self, context, filters=None, fields=None,
@@ -555,55 +570,45 @@ class OVSQuantumPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
             for net in nets:
                 self._extend_network_dict_provider(context, net)
                 self._extend_network_dict_l3(context, net)
-
+                self._extend_network_dict_multihost(context, net)
         return [self._fields(net, fields) for net in nets]
-
-    def _extend_port_dict_binding(self, context, port):
-        if self._check_view_auth(context, port, self.binding_view):
-            port[portbindings.VIF_TYPE] = portbindings.VIF_TYPE_OVS
-            port[portbindings.CAPABILITIES] = {
-                portbindings.CAP_PORT_FILTER:
-                'security-group' in self.supported_extension_aliases}
-        return port
 
     def create_port(self, context, port):
         # Set port status as 'DOWN'. This will be updated by agent
         port['port']['status'] = q_const.PORT_STATUS_DOWN
+        port_data = port['port']
         session = context.session
         with session.begin(subtransactions=True):
             self._ensure_default_security_group_on_port(context, port)
             sgids = self._get_security_groups_on_port(context, port)
             port = super(OVSQuantumPluginV2, self).create_port(context, port)
-            self._process_port_create_security_group(
-                context, port['id'], sgids)
-            self._extend_port_dict_security_group(context, port)
+            self._process_portbindings_create_and_update(context,
+                                                         port_data, port)
+            self._process_port_create_security_group(context, port, sgids)
         self.notify_security_groups_member_updated(context, port)
-        return self._extend_port_dict_binding(context, port)
+        return self._check_portbindings_view_auth(context, port)
 
     def get_port(self, context, id, fields=None):
         with context.session.begin(subtransactions=True):
             port = super(OVSQuantumPluginV2, self).get_port(context,
-                                                            id, fields)
-            self._extend_port_dict_security_group(context, port)
-            self._extend_port_dict_binding(context, port)
-        return self._fields(port, fields)
+                                                            id,
+                                                            fields)
+        return self._check_portbindings_view_auth(context, port)
 
     def get_ports(self, context, filters=None, fields=None,
-                  sorts=None, limit=None, marker=None,
-                  page_reverse=False):
+                  sorts=None, limit=None, marker=None, page_reverse=False):
+        res_ports = []
         with context.session.begin(subtransactions=True):
-            ports = super(OVSQuantumPluginV2, self).get_ports(
-                context, filters, fields, sorts, limit, marker,
-                page_reverse)
-            #TODO(nati) filter by security group
+            ports = super(OVSQuantumPluginV2,
+                          self).get_ports(context, filters, fields, sorts,
+                                          limit, marker, page_reverse)
             for port in ports:
-                self._extend_port_dict_security_group(context, port)
-                self._extend_port_dict_binding(context, port)
-        return [self._fields(port, fields) for port in ports]
+                self._check_portbindings_view_auth(context, port)
+                res_ports.append(port)
+        return res_ports
 
     def update_port(self, context, id, port):
         session = context.session
-
         need_port_update_notify = False
         with session.begin(subtransactions=True):
             original_port = super(OVSQuantumPluginV2, self).get_port(
@@ -612,10 +617,11 @@ class OVSQuantumPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                 context, id, port)
             need_port_update_notify = self.update_security_group_on_port(
                 context, id, port, original_port, updated_port)
-
+            self._process_portbindings_create_and_update(context,
+                                                         port['port'],
+                                                         updated_port)
         need_port_update_notify |= self.is_security_group_member_updated(
             context, original_port, updated_port)
-
         if original_port['admin_state_up'] != updated_port['admin_state_up']:
             need_port_update_notify = True
 
@@ -626,8 +632,7 @@ class OVSQuantumPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                                       binding.network_type,
                                       binding.segmentation_id,
                                       binding.physical_network)
-
-        return self._extend_port_dict_binding(context, updated_port)
+        return self._check_portbindings_view_auth(context, updated_port)
 
     def delete_port(self, context, id, l3_port_check=True):
 
@@ -644,3 +649,96 @@ class OVSQuantumPluginV2(db_base_plugin_v2.QuantumDbPluginV2,
             super(OVSQuantumPluginV2, self).delete_port(context, id)
 
         self.notify_security_groups_member_updated(context, port)
+
+    def _get_sync_floating_ips(self, context, router_ids):
+        """Query floating_ips that relate to list of router_ids."""
+        if not router_ids:
+            return []
+        floatingips = self.get_floatingips(context,
+                                           {'router_id': router_ids})
+        for floatingip in floatingips:
+            fixed_port = self.get_port(context, floatingip['port_id'])
+            floatingip[portbindings.HOST_ID] = fixed_port.get(
+                portbindings.HOST_ID)
+        return floatingips
+
+    def get_router(self, context, id, fields=None):
+        with context.session.begin(subtransactions=True):
+            router = super(OVSQuantumPluginV2, self).get_router(
+                context, id, fields)
+            self._extend_router_dict_multihost(context, router)
+            return router
+
+    def get_routers(self, context, filters=None, fields=None,
+                    sorts=None, limit=None, marker=None,
+                    page_reverse=False):
+        with context.session.begin(subtransactions=True):
+            routers = super(OVSQuantumPluginV2, self).get_routers(
+                context, filters, fields, sorts=sorts, limit=limit,
+                marker=marker, page_reverse=page_reverse)
+            for router in routers:
+                self._extend_router_dict_multihost(context, router)
+            return routers
+
+    def create_router(self, context, router):
+        with context.session.begin(subtransactions=True):
+            router_result = super(OVSQuantumPluginV2, self).create_router(
+                context, router)
+            self._process_multihost_router_create(
+                context, router['router'], router_result['id'])
+            self._extend_router_dict_multihost(context, router_result)
+        return router_result
+
+    def get_sync_data(self, context, router_ids=None, active=None,
+                      multi_host=None):
+        if multi_host:
+            filters = {multihost.MULTIHOST: [True]}
+            routers = super(OVSQuantumPluginV2,
+                            self).get_sync_data(context, router_ids,
+                                                active=active,
+                                                filters=filters)
+        else:
+            routers = super(OVSQuantumPluginV2,
+                            self).get_sync_data(context, router_ids,
+                                                active=active)
+        return routers
+
+    def _update_router_gw_info(self, context, router_id, info):
+        router = self.get_router(context, router_id)
+        ori_gw_network_id = (router['external_gateway_info'].get('network_id')
+                             if router['external_gateway_info'] else None)
+        super(OVSQuantumPluginV2, self)._update_router_gw_info(
+            context, router_id, info)
+        if router.get(multihost.MULTIHOST_NET):
+            router = self.get_router(context, router_id)
+            new_gw_network_id = (
+                router['external_gateway_info'].get('network_id')
+                if router['external_gateway_info'] else None)
+            if ori_gw_network_id and (
+                not new_gw_network_id or
+                ori_gw_network_id != new_gw_network_id):
+                self.delete_router_gw_ports_on_hosts(context, router_id)
+
+    def add_router_interface(self, context, router_id, interface_info):
+        router_multihost_net = self.get_multihost_net_by_router(
+            context, router_id)
+        subnet = None
+        if 'subnet_id' in interface_info:
+            subnet_id = interface_info['subnet_id']
+            subnet = self._get_subnet(context, subnet_id)
+        if router_multihost_net and interface_info:
+            if subnet and subnet.network_id != router_multihost_net:
+                msg = (_('The interface on this subnet is not '
+                         'allowed on multihosted router'))
+                raise q_exc.BadRequest(resource='router', msg=msg)
+            if 'port_id' in interface_info:
+                msg = _('Multihosted router does not allow adding'
+                        'interface on port')
+                raise q_exc.BadRequest(resource='router', msg=msg)
+        if (subnet and not router_multihost_net and
+            self.is_multihost_network(context, subnet.network_id)):
+            msg = (_('The interface on this subnet is not '
+                     'allowed on non-multihosted router'))
+            raise q_exc.BadRequest(resource='router', msg=msg)
+        return super(OVSQuantumPluginV2, self).add_router_interface(
+            context, router_id, interface_info)

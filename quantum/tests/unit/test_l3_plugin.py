@@ -16,6 +16,7 @@
 #    under the License.
 #
 # @author: Dan Wendlandt, Nicira, Inc
+# @author: Yong Sheng Gong, UnistedStack, Inc
 #
 
 import contextlib
@@ -339,10 +340,25 @@ class L3NatTestCaseMixin(object):
 
         return router_req.get_response(self.ext_api)
 
-    def _make_router(self, fmt, tenant_id, name=None,
-                     admin_state_up=None, set_context=False):
+    def _make_router(self, fmt, tenant_id, name=None, admin_state_up=None,
+                     external_gateway_info=None, set_context=False,
+                     expected_code=None, **kwargs):
+        arg_list = kwargs.pop('arg_list', None)
+        _arg_list = []
+        if arg_list:
+            _arg_list = list(arg_list)
+        if external_gateway_info:
+            _arg_list.append('external_gateway_info')
+        arg_list = _arg_list and tuple(_arg_list) or None
         res = self._create_router(fmt, tenant_id, name,
-                                  admin_state_up, set_context)
+                                  admin_state_up, set_context,
+                                  arg_list=arg_list,
+                                  external_gateway_info=external_gateway_info,
+                                  **kwargs)
+        if expected_code:
+            self.assertEqual(res.status_int, expected_code)
+        if res.status_int >= 400:
+            raise exc.HTTPClientError(code=res.status_int)
         return self.deserialize(fmt, res)
 
     def _add_external_gateway_to_router(self, router_id, network_id,
@@ -377,9 +393,13 @@ class L3NatTestCaseMixin(object):
 
     @contextlib.contextmanager
     def router(self, name='router1', admin_state_up=True,
-               fmt=None, tenant_id=_uuid(), set_context=False):
+               fmt=None, tenant_id=_uuid(),
+               external_gateway_info=None, set_context=False,
+               expected_code=None, **kwargs):
         router = self._make_router(fmt or self.fmt, tenant_id, name,
-                                   admin_state_up, set_context)
+                                   admin_state_up, external_gateway_info,
+                                   set_context,
+                                   expected_code=expected_code, **kwargs)
         try:
             yield router
         finally:
