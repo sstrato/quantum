@@ -1,4 +1,6 @@
 # -- Welcome!
+ 
+  Modified version of Quantum for KONG - based on 2013.1.2
 
   You have come across a cloud computing network fabric controller.  It has
   identified itself as "Quantum."  It aims to tame your (cloud) networking!
