@@ -248,7 +248,7 @@ class Multihost_db_mixin(object):
                     mac_address=attributes.ATTR_NOT_SPECIFIED,
                     name='',
                     device_owner=constants.MULTIHOST_OWNER_DEVICE_ROUTER_GW,
-                    fixed_ips=[{'subnet_id': subnet_id}])
+                    fixed_ips=attributes.ATTR_NOT_SPECIFIED)
 
                 retval = self.create_port(context, dict(port=port_dict))
                 port_db = self._get_port(context, retval['id'])
