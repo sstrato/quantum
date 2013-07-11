@@ -36,6 +36,8 @@ from quantum.db import l3_rpc_base
 from quantum.db import portbindings_db
 from quantum.db import quota_db  # noqa
 from quantum.db import securitygroups_rpc_base as sg_db_rpc
+from quantum.db import multihost_db
+from quantum.extensions import multihost
 from quantum.extensions import portbindings
 from quantum.extensions import providernet as provider
 from quantum.extensions import securitygroup as ext_sg
@@ -69,7 +71,8 @@ class LinuxBridgeRpcCallbacks(dhcp_rpc_base.DhcpRpcCallbackMixin,
         one class as the target of rpc messages, override this method.
         '''
         return q_rpc.PluginRpcDispatcher([self,
-                                          agents_db.AgentExtRpcCallback()])
+                                          agents_db.AgentExtRpcCallback(),
+                                          multihost_db.L3MultihostPluginApiCallback()])
 
     @classmethod
     def get_port_from_device(cls, device):
@@ -179,7 +182,8 @@ class LinuxBridgePluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                           extraroute_db.ExtraRoute_db_mixin,
                           sg_db_rpc.SecurityGroupServerRpcMixin,
                           agentschedulers_db.AgentSchedulerDbMixin,
-                          portbindings_db.PortBindingMixin):
+                          portbindings_db.PortBindingMixin,
+                          multihost_db.Multihost_db_mixin):
     """Implement the Quantum abstractions using Linux bridging.
 
     A new VLAN is created for each network.  An agent is relied upon
@@ -205,7 +209,8 @@ class LinuxBridgePluginV2(db_base_plugin_v2.QuantumDbPluginV2,
 
     _supported_extension_aliases = ["provider", "router", "binding", "quotas",
                                     "security-group", "agent", "extraroute",
-                                    "agent_scheduler"]
+                                    "agent_scheduler",
+                                    "multihost"]
 
     @property
     def supported_extension_aliases(self):
@@ -423,8 +428,11 @@ class LinuxBridgePluginV2(db_base_plugin_v2.QuantumDbPluginV2,
             db.add_network_binding(session, net['id'],
                                    physical_network, vlan_id)
             self._process_l3_create(context, network['network'], net['id'])
+            self._process_multihost_net_create(
+                context, network['network'], net['id'])
             self._extend_network_dict_provider(context, net)
             self._extend_network_dict_l3(context, net)
+            self._extend_network_dict_multihost(context, net)
             # note - exception will rollback entire transaction
         return net
 
@@ -438,6 +446,7 @@ class LinuxBridgePluginV2(db_base_plugin_v2.QuantumDbPluginV2,
             self._process_l3_update(context, network['network'], id)
             self._extend_network_dict_provider(context, net)
             self._extend_network_dict_l3(context, net)
+            self._extend_network_dict_multihost(context, net)
         return net
 
     def delete_network(self, context, id):
@@ -459,6 +468,7 @@ class LinuxBridgePluginV2(db_base_plugin_v2.QuantumDbPluginV2,
                                                                id, None)
             self._extend_network_dict_provider(context, net)
             self._extend_network_dict_l3(context, net)
+            self._extend_network_dict_multihost(context, net)
         return self._fields(net, fields)
 
     def get_networks(self, context, filters=None, fields=None,
@@ -471,7 +481,7 @@ class LinuxBridgePluginV2(db_base_plugin_v2.QuantumDbPluginV2,
             for net in nets:
                 self._extend_network_dict_provider(context, net)
                 self._extend_network_dict_l3(context, net)
-
+                self._extend_network_dict_multihost(context, net)
         return [self._fields(net, fields) for net in nets]
 
     def get_port(self, context, id, fields=None):
@@ -558,3 +568,96 @@ class LinuxBridgePluginV2(db_base_plugin_v2.QuantumDbPluginV2,
         self.notifier.port_update(context, port,
                                   binding.physical_network,
                                   binding.vlan_id)
+
+    def _get_sync_floating_ips(self, context, router_ids):
+        """Query floating_ips that relate to list of router_ids."""
+        if not router_ids:
+            return []
+        floatingips = self.get_floatingips(context,
+                                           {'router_id': router_ids})
+        for floatingip in floatingips:
+            fixed_port = self.get_port(context, floatingip['port_id'])
+            floatingip[portbindings.HOST_ID] = fixed_port.get(
+                portbindings.HOST_ID)
+        return floatingips
+
+    def get_router(self, context, id, fields=None):
+        with context.session.begin(subtransactions=True):
+            router = super(LinuxBridgePluginV2, self).get_router(
+                context, id, fields)
+            self._extend_router_dict_multihost(context, router)
+            return router
+
+    def get_routers(self, context, filters=None, fields=None,
+                    sorts=None, limit=None, marker=None,
+                    page_reverse=False):
+        with context.session.begin(subtransactions=True):
+            routers = super(LinuxBridgePluginV2, self).get_routers(
+                context, filters, fields, sorts=sorts, limit=limit,
+                marker=marker, page_reverse=page_reverse)
+            for router in routers:
+                self._extend_router_dict_multihost(context, router)
+            return routers
+
+    def create_router(self, context, router):
+        with context.session.begin(subtransactions=True):
+            router_result = super(LinuxBridgePluginV2, self).create_router(
+                context, router)
+            self._process_multihost_router_create(
+                context, router['router'], router_result['id'])
+            self._extend_router_dict_multihost(context, router_result)
+        return router_result
+
+    def get_sync_data(self, context, router_ids=None, active=None,
+                      multi_host=None):
+        if multi_host:
+            filters = {multihost.MULTIHOST: [True]}
+            routers = super(LinuxBridgePluginV2,
+                            self).get_sync_data(context, router_ids,
+                                                active=active,
+                                                filters=filters)
+        else:
+            routers = super(LinuxBridgePluginV2,
+                            self).get_sync_data(context, router_ids,
+                                                active=active)
+        return routers
+
+    def _update_router_gw_info(self, context, router_id, info):
+        router = self.get_router(context, router_id)
+        ori_gw_network_id = (router['external_gateway_info'].get('network_id')
+                             if router['external_gateway_info'] else None)
+        super(LinuxBridgePluginV2, self)._update_router_gw_info(
+            context, router_id, info)
+        if router.get(multihost.MULTIHOST_NET):
+            router = self.get_router(context, router_id)
+            new_gw_network_id = (
+                router['external_gateway_info'].get('network_id')
+                if router['external_gateway_info'] else None)
+            if ori_gw_network_id and (
+                not new_gw_network_id or
+                ori_gw_network_id != new_gw_network_id):
+                self.delete_router_gw_ports_on_hosts(context, router_id)
+
+    def add_router_interface(self, context, router_id, interface_info):
+        router_multihost_net = self.get_multihost_net_by_router(
+            context, router_id)
+        subnet = None
+        if 'subnet_id' in interface_info:
+            subnet_id = interface_info['subnet_id']
+            subnet = self._get_subnet(context, subnet_id)
+        if router_multihost_net and interface_info:
+            if subnet and subnet.network_id != router_multihost_net:
+                msg = (_('The interface on this subnet is not '
+                         'allowed on multihosted router'))
+                raise q_exc.BadRequest(resource='router', msg=msg)
+            if 'port_id' in interface_info:
+                msg = _('Multihosted router does not allow adding'
+                        'interface on port')
+                raise q_exc.BadRequest(resource='router', msg=msg)
+        if (subnet and not router_multihost_net and
+            self.is_multihost_network(context, subnet.network_id)):
+            msg = (_('The interface on this subnet is not '
+                     'allowed on non-multihosted router'))
+            raise q_exc.BadRequest(resource='router', msg=msg)
+        return super(LinuxBridgePluginV2, self).add_router_interface(
+            context, router_id, interface_info)
