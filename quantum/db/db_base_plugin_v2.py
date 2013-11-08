@@ -491,7 +491,13 @@ class QuantumDbPluginV2(quantum_plugin_base_v2.QuantumPluginBaseV2):
                 context.session.delete(range)
             else:
                 # increment the first free
-                range['first_ip'] = str(netaddr.IPAddress(ip_address) + 1)
+                # skip x.x.x.0 and x.x.x.254
+                lastNo = ip_address.split('.')[3]
+                if lastNo == '254':
+                    range['first_ip'] = str(netaddr.IPAddress(ip_address) + 3)
+                else:
+                    range['first_ip'] = str(netaddr.IPAddress(ip_address) + 1)
+
             return {'ip_address': ip_address, 'subnet_id': subnet['id']}
         raise q_exc.IpAddressGenerationFailure(net_id=subnets[0]['network_id'])
 
@@ -779,7 +785,7 @@ class QuantumDbPluginV2(quantum_plugin_base_v2.QuantumPluginBaseV2):
             subnet_first_ip = subnet_last_ip = netaddr.IPAddress(subnet.first)
         # add /31 here later, if needed
         else:
-            subnet_first_ip = netaddr.IPAddress(subnet.first + 1) 
+            subnet_first_ip = netaddr.IPAddress(subnet.first + 1)
             subnet_last_ip = netaddr.IPAddress(subnet.last - 1)
 
         LOG.debug(_("Performing IP validity checks on allocation pools"))
@@ -1134,7 +1140,7 @@ class QuantumDbPluginV2(quantum_plugin_base_v2.QuantumPluginBaseV2):
         mask = s['cidr'].split('/')[1]
 
         if mask == '32':
-            s['gateway_ip'] = None 
+            s['gateway_ip'] = None
             s['enable_dhcp'] = False
         # add /31 here later, if needed
         else:
